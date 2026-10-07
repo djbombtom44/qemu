@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TempleOS (Shrine) in QEMU-wasm</title>
+<style>
+html,body{margin:0;height:100%;background:#111;color:#ccc;font:14px system-ui,sans-serif}
+#wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px}
+#stage{position:relative;line-height:0}
+canvas{background:#000;image-rendering:pixelated;max-width:96vw;max-height:80vh;outline:2px solid #333}
+canvas:focus{outline-color:#4a9}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;line-height:1.5;background:#000c;padding:1em;white-space:pre-line}
+button{background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:6px 12px;cursor:pointer}
+#bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center}
+select,label{color:#ccc}select{background:#222;border:1px solid #444;border-radius:6px;padding:5px}
+#launch{display:flex;flex-direction:column;gap:10px;align-items:center}
+#launch.hide{display:none}
+.s1 canvas{max-width:none;max-height:none;width:calc(var(--w)*1px)}.s2 canvas{max-width:none;max-height:none;width:calc(var(--w)*2px)}
+#stage.s1,#stage.s2{overflow:auto;max-width:96vw;max-height:80vh}
+</style></head><body>
+<div id="wrap">
+  <div id="stage"><canvas id="c" width="640" height="480" tabindex="0"></canvas>
+    <div id="msg"><div id="launch">
+  <b>TempleOS (Shrine) · QEMU-wasm</b>
+  <button id="go">Boot bundled Shrine ISO</button>
+  <div>or <input type="file" id="iso" accept=".iso,.img"> <button id="goiso" disabled>Boot this ISO</button></div>
+  <label><input type="checkbox" id="net" checked> Network (in-browser: DNS + HTTP only)</label>
+  <label>Relay (wss://, blank = in-browser) <input id="relay" size="30" value="wss://relay.widgetry.org/"></label>
+  <label>CORS proxy (in-browser mode only)  <input id="proxy" size="28" placeholder="optional, e.g. https://proxy.example/?url="></label>
+  <label>CPUs <select id="smp"><option selected>1</option><option>2</option><option>4</option><option>8</option></select></label>
+  <label>RAM <select id="ram"><option>256</option><option selected>512</option><option>1024</option></select> MB</label>
+</div><span id="status"></span><button id="lg" style="margin-top:8px;font-size:12px">Show log</button><pre id="log" style="display:none;text-align:left;max-height:30vh;overflow:auto;font-size:11px;max-width:90vw;white-space:pre-wrap"></pre></div></div>
+  <div id="bar"><button id="pz" disabled>Pause</button><select id="sc"><option value="">Fit</option><option value="s1">1×</option><option value="s2">2×</option></select><button id="fs">Fullscreen</button><button id="rs">Restart</button>
+    <span id="st"></span></div>
+  <div style="opacity:.6">Click the screen to focus and capture the mouse. Esc releases the mouse.</div>
+</div>
+<script src="netstack.js"></script>
+<script>
+const $=id=>document.getElementById(id), msg=$('msg'), cv=$('c'), ctx=cv.getContext('2d'), st=$('st');
+$('rs').onclick=()=>location.reload();
+$('fs').onclick=()=>cv.requestFullscreen();
+
+if(!self.crossOriginIsolated){
+  // Static hosts can't set COOP/COEP headers, so a small service worker adds them (needs HTTPS or localhost).
+  const tries=+sessionStorage.coi||0, fail=m=>{msg.textContent=m};
+  if(window.isSecureContext&&'serviceWorker' in navigator&&tries<2){
+    msg.textContent='Setting up (one-time reload)…';
+    navigator.serviceWorker.register('coi-serviceworker.js').catch(()=>navigator.serviceWorker.register('sw.js')).then(r=>{
+      const go=()=>{sessionStorage.coi=tries+1;location.reload()};
+      if(navigator.serviceWorker.controller||r.active)go(); else navigator.serviceWorker.addEventListener('controllerchange',go);
+    }).catch(e=>fail('Service worker failed: '+e.message));
+  } else fail("This page needs cross-origin isolation (SharedArrayBuffer).\nServe it over HTTPS (or localhost), or send the headers\nCross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp.");
+  throw new Error('not isolated');
+}
+sessionStorage.coi=0;
+
+// QEMU "qnum" key numbers (XT set-1 scancodes; extended keys = 0x80|code), which is what
+// qemu_input_event_send_key_number() expects. (The old table used QKeyCode enum values, so the
+// guest saw e.g. Ctrl(5) as scancode 5 = "4", Enter(35) as 0x23 = "h", Backspace(21) as 0x15 = "y".)
+const QK={Escape:0x01,Digit1:0x02,Digit2:0x03,Digit3:0x04,Digit4:0x05,Digit5:0x06,Digit6:0x07,Digit7:0x08,Digit8:0x09,Digit9:0x0a,Digit0:0x0b,
+Minus:0x0c,Equal:0x0d,Backspace:0x0e,Tab:0x0f,KeyQ:0x10,KeyW:0x11,KeyE:0x12,KeyR:0x13,KeyT:0x14,KeyY:0x15,KeyU:0x16,KeyI:0x17,KeyO:0x18,KeyP:0x19,
+BracketLeft:0x1a,BracketRight:0x1b,Enter:0x1c,ControlLeft:0x1d,KeyA:0x1e,KeyS:0x1f,KeyD:0x20,KeyF:0x21,KeyG:0x22,KeyH:0x23,KeyJ:0x24,KeyK:0x25,KeyL:0x26,
+Semicolon:0x27,Quote:0x28,Backquote:0x29,ShiftLeft:0x2a,Backslash:0x2b,KeyZ:0x2c,KeyX:0x2d,KeyC:0x2e,KeyV:0x2f,KeyB:0x30,KeyN:0x31,KeyM:0x32,
+Comma:0x33,Period:0x34,Slash:0x35,ShiftRight:0x36,NumpadMultiply:0x37,AltLeft:0x38,Space:0x39,CapsLock:0x3a,
+F1:0x3b,F2:0x3c,F3:0x3d,F4:0x3e,F5:0x3f,F6:0x40,F7:0x41,F8:0x42,F9:0x43,F10:0x44,NumLock:0x45,ScrollLock:0x46,
+Numpad7:0x47,Numpad8:0x48,Numpad9:0x49,NumpadSubtract:0x4a,Numpad4:0x4b,Numpad5:0x4c,Numpad6:0x4d,NumpadAdd:0x4e,
+Numpad1:0x4f,Numpad2:0x50,Numpad3:0x51,Numpad0:0x52,NumpadDecimal:0x53,IntlBackslash:0x56,F11:0x57,F12:0x58,
+NumpadEnter:0x9c,ControlRight:0x9d,NumpadDivide:0xb5,PrintScreen:0xb7,AltRight:0xb8,Pause:0xc6,
+Home:0xc7,ArrowUp:0xc8,PageUp:0xc9,ArrowLeft:0xcb,ArrowRight:0xcd,End:0xcf,ArrowDown:0xd0,PageDown:0xd1,Insert:0xd2,Delete:0xd3,
+MetaLeft:0xdb,MetaRight:0xdc,ContextMenu:0xdd};
+
+const MEM=2411724800; // matches the build's fixed memory size
+const mem=new WebAssembly.Memory({initial:MEM/65536,maximum:MEM/65536,shared:true});
+
+// The glue was built for xterm-pty and wants a terminal object. We use it as QEMU's stdio, which carries the
+// HMP monitor (pause/resume). The glue's poll() on stdio used to block QEMU's main loop until a key arrived
+// (freezing the guest); qemu-system-x86_64.js is patched so that wait is capped at 10 ms.
+const mon={q:[],cbs:new Set(),out:''};
+const pty={get readable(){return mon.q.length>0},writable:true,
+  read:n=>mon.q.splice(0,n), write:a=>{mon.out+=String.fromCharCode(...a); if(mon.out.length>4000)mon.out=mon.out.slice(-2000)},
+  ioctl:n=>n==='TIOCGWINSZ'?[80,24]:{iflag:0,oflag:0,cflag:0,lflag:0,cc:new Array(32).fill(0)},
+  onReadable:cb=>{mon.cbs.add(cb);return{dispose(){mon.cbs.delete(cb)}}},
+  onSignal:()=>({dispose(){}})};
+const monitor=cmd=>{ for(const c of cmd+'\n') mon.q.push(c.charCodeAt(0)); [...mon.cbs].forEach(f=>f()) };
+
+const logEl=()=>$('log'), L=t=>{const e=logEl(); if(e){e.textContent+=t+'\n'; e.scrollTop=1e9}};
+addEventListener('error',e=>L('ERROR: '+e.message)); addEventListener('unhandledrejection',e=>L('REJECTED: '+(e.reason&&e.reason.message||e.reason)));
+$('lg').onclick=()=>{const e=logEl();e.style.display=e.style.display?'':'block'};
+var Module={ wasmMemory:mem, pty, print:t=>{console.log(t);L(t)}, printErr:t=>{console.warn(t);L(t)},
+  setStatus:t=>{ if(t) $('status').textContent=t },
+  onRuntimeInitialized(){ setTimeout(start,500); } };
+
+const addScript=src=>new Promise((ok,bad)=>{const e=document.createElement('script');e.src=src;e.onload=ok;e.onerror=bad;document.body.appendChild(e)});
+
+async function boot(file){
+  $('launch').classList.add('hide'); const status=$('status');
+  let iso='/pack/Shrine-v5051.iso';
+  if(file){ status.textContent='Reading ISO…'; const buf=new Uint8Array(await file.arrayBuffer()); iso='/custom.iso';
+    (Module.preRun??=[]).push(()=>Module.FS_createDataFile('/','custom.iso',buf,true,true,true)); }
+  let net=['-nic','none'], note='';
+  if($('net').checked){
+    NetStack.install({proxy:$('proxy').value.trim(),relay:$('relay').value.trim()}); // QEMU's socket netdev talks to this instead of a real WebSocket
+    net=['-netdev','socket,id=n0,connect=127.0.0.1:8001','-device','pcnet,netdev=n0,mac=52:54:00:12:34:56,romfile=']; note=$('relay').value.trim()?' (network via relay)':' (in-browser network)';
+  }
+  const smp=+$('smp').value;
+  // SMP needs multi-threaded TCG (the wasm JIT state is per-thread, so round-robin TCG breaks with >1 vCPU).
+  // Each vCPU is a pthread, so pre-spawn enough workers (vCPUs + RCU/IO helpers); creating them later can deadlock.
+  if(smp>1) Module.pthreadPoolSize=smp+4;
+  Module.arguments=['-machine','pc','-cpu','qemu64','-smp',String(smp),'-m',$('ram').value,'-accel',smp>1?'tcg,tb-size=256,thread=multi':'tcg,tb-size=256',
+    '-L','/pack','-cdrom',iso,'-boot','d','-vga','std',...net,'-serial','none','-monitor','stdio','-display','none'];
+  status.textContent='Loading emulator (about 45 MB)…'+note;
+  await addScript('load.js'); await addScript('qemu-system-x86_64.js');
+}
+$('go').onclick=()=>boot(null);
+$('iso').onchange=()=>$('goiso').disabled=!$('iso').files[0];
+$('goiso').onclick=()=>boot($('iso').files[0]);
+let paused=false;
+$('pz').onclick=()=>{ paused=!paused; monitor(paused?'stop':'cont'); $('pz').textContent=paused?'Resume':'Pause'; if(!paused)cv.focus() };
+$('sc').onchange=e=>{ $('stage').className=e.target.value };
+
+let W=0,H=0,img=null,lastFrame=-1,booted=false;
+function start(){
+  const M=Module; let n=0; $('status').textContent='Starting QEMU…';
+  const tryInit=()=>{
+    if(M._qemu_display_width()>0) return;
+    try{ M._qemu_setup_display() }catch(e){L('setup: '+e)}
+    if(++n===20) $('status').textContent='Still no display after 20 s. Click "Show log" for details.';
+    setTimeout(tryInit,1000) };
+  tryInit(); requestAnimationFrame(draw);
+}
+function draw(){
+  const M=Module;
+  const w=M._qemu_display_width(), h=M._qemu_display_height();
+  if(w>0&&h>0){
+    if(msg.style.display!=='none'){msg.style.display='none';$('pz').disabled=false}
+    if(w!==W||h!==H){W=w;H=h;cv.width=w;cv.height=h;img=ctx.createImageData(w,h);$('stage').style.setProperty('--w',w)}
+    const fc=M._qemu_display_frame_count(), dirty=M._qemu_display_check_dirty();
+    if(dirty||fc!==lastFrame){
+      lastFrame=fc;
+      const p=M._qemu_display_data(), stride=M._qemu_display_stride()||w*4;
+      const src=new Uint8Array(mem.buffer), dst=img.data;
+      // framebuffer is little-endian xRGB (bytes B,G,R,x)
+      for(let y=0;y<h;y++){
+        let s=p+y*stride, d=y*w*4;
+        for(let x=0;x<w;x++,s+=4,d+=4){dst[d]=src[s+2];dst[d+1]=src[s+1];dst[d+2]=src[s];dst[d+3]=255}
+      }
+      ctx.putImageData(img,0,0);
+      st.textContent=w+'×'+h;
+    }
+  }
+  requestAnimationFrame(draw);
+}
+
+// keyboard
+const held=new Set();
+const key=(e,down)=>{const q=QK[e.code]; if(q===undefined)return;
+  e.preventDefault(); down?held.add(q):held.delete(q); Module._qemu_input_send_key(q,down?1:0)};
+cv.addEventListener('keydown',e=>{ if(e.repeat){e.preventDefault();return} key(e,1)});
+cv.addEventListener('keyup',e=>key(e,0));
+cv.addEventListener('blur',()=>{ for(const q of held) Module._qemu_input_send_key(q,0); held.clear() });
+
+// mouse: relative via pointer lock
+let btn=0;
+cv.addEventListener('click',()=>{cv.focus(); if(document.pointerLockElement!==cv) cv.requestPointerLock?.()});
+const sendM=(dx,dy)=>Module._qemu_input_send_mouse(dx|0,dy|0,0,btn);
+cv.addEventListener('mousemove',e=>{ if(document.pointerLockElement===cv) sendM(e.movementX,e.movementY)});
+cv.addEventListener('mousedown',e=>{ if(document.pointerLockElement!==cv)return;
+  btn|=[1,4,2][e.button]||0; sendM(0,0); e.preventDefault()});
+addEventListener('mouseup',e=>{ if(document.pointerLockElement!==cv)return;
+  btn&=~([1,4,2][e.button]||0); sendM(0,0)});
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+</script>
+</body></html>
